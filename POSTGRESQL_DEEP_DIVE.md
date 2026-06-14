@@ -32,6 +32,18 @@ A tuple is visible to your transaction if `xmin` is committed and ≤ your snaps
 SELECT xmin, xmax, ctid, * FROM customers WHERE id = 42;
 ```
 
+### `xmax` is not always a deletion (and not a live lock)
+A **visible** row can show a non-zero `xmax`. `xmax` doubles as a **row-lock marker**, not just a deleter XID:
+
+- A **foreign-key insert** on a child row takes a `FOR KEY SHARE` lock on the parent row, stamping the parent's `xmax`. `SELECT … FOR UPDATE/SHARE` does the same.
+- The **infomask** bits (e.g. `HEAP_XMAX_LOCK_ONLY`) tell the visibility check it's a lock, so the row stays alive.
+
+A set `xmax` does **not** mean a lock is currently held. Row locks live in shared memory and are released when the transaction ends; Postgres does **not** eagerly clear `xmax` on commit. So the value lingers as a stale physical marker, resolved lazily at read time and only physically cleared later by **freezing**.
+
+- Check live locks with `pg_locks`, **not** `xmax`.
+- Plain `VACUUM` won't clear it on a **live, young** tuple — freezing is gated by `vacuum_freeze_min_age` (default 50M XIDs). Force it with `VACUUM (FREEZE) <table>;`.
+- The `xmax` system column shows the **raw** header field; it ignores infomask, so it can still display an old XID even after the lock is logically invalid.
+
 ### What goes wrong
 - **Dead tuples accumulate** — old versions left behind by UPDATE/DELETE. Until vacuumed, they sit in the table consuming space → **bloat**.
 - **Transaction ID wraparound** — XIDs are 32-bit (~4 billion). If old tuples aren't "frozen" before the XID counter wraps, Postgres would see future data as past → catastrophic. Postgres force-shuts down to prevent this.
