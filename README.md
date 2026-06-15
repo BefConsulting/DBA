@@ -5,6 +5,7 @@ Telecom SaaS dummy data for learning `EXPLAIN (ANALYZE, BUFFERS)`.
 **Study guides:**
 - [POSTGRESQL_DEEP_DIVE.md](POSTGRESQL_DEEP_DIVE.md) — the big one: internals (MVCC/WAL/vacuum/bloat/planner), performance tuning, HA & scaling, security
 - [PERFORMANCE_ANALYSIS.md](PERFORMANCE_ANALYSIS.md) — where to start, what to check, the full investigation funnel
+- [WAL_AND_CHECKPOINTS.md](WAL_AND_CHECKPOINTS.md) — WAL vs dirty buffers, checkpoints, crash recovery
 - [CACHE.md](CACHE.md) — cold vs warm cache explained
 
 ## Setup

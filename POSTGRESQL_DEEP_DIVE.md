@@ -165,6 +165,17 @@ Change -> WAL buffer -> WAL on disk (fsync at COMMIT) -> later, dirty pages
                                                           at a CHECKPOINT
 ```
 
+### WAL vs dirty buffers (quick distinction)
+Two representations of the same change: **WAL makes it durable; dirty buffers make it fast.**
+
+- **Dirty buffer** — the actual 8KB data page modified in `shared_buffers` (RAM) but not yet written to the data file. Flushing every change straight to the data file = slow random writes, so Postgres batches them.
+- **WAL record** — a compact, sequential log entry describing the change, `fsync`'d to disk at **COMMIT**. The commit is durable the instant WAL is on disk, even though the data page is still only in RAM.
+- **Write-ahead rule:** a dirty buffer is never written to the data file before its WAL record is on disk.
+- **On crash:** the lost-from-RAM dirty buffers are reconstructed by **replaying WAL** (REDO) → no committed data lost.
+- **Checkpoint:** flushes all dirty buffers to data files and advances the redo point so older WAL can be recycled; checkpoint frequency bounds crash-recovery time.
+
+Full walkthrough (diagrams, checkpoint params, monitoring): **[WAL_AND_CHECKPOINTS.md](WAL_AND_CHECKPOINTS.md)**.
+
 Key terms:
 - **LSN (Log Sequence Number)** — a byte position in the WAL stream; how Postgres tracks progress and replication lag.
 - **Checkpoint** — point where all dirty buffers are flushed to data files; bounds crash recovery time.
