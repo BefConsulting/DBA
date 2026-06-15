@@ -1,214 +1,41 @@
-# WAL, Dirty Buffers & Checkpoints
+# WAL, Dirty Buffers & Checkpoints — Tuning & Troubleshooting
 
-How PostgreSQL gets **durability and speed at the same time**: a compact log written at commit (WAL) plus actual data pages flushed lazily later (dirty buffers), reconciled at checkpoints.
+Focus: **how to find current settings, pick optimal values, and troubleshoot checkpoint/WAL problems.** Basics are condensed up top for reference.
 
 **See also:** [POSTGRESQL_DEEP_DIVE.md](POSTGRESQL_DEEP_DIVE.md) §1.2 · [CACHE.md](CACHE.md) · [PERFORMANCE_ANALYSIS.md](PERFORMANCE_ANALYSIS.md)
 
 ---
 
-## WAL vs Dirty Buffers — the core distinction
+## Basics (condensed)
 
-Two representations of the same change, with two different jobs: **WAL makes changes durable; dirty buffers make changes fast.**
-
-| | **WAL record** | **Dirty buffer** |
-|---|----------------|------------------|
-| **What** | A small log entry describing *what changed* | A full 8KB data page in memory that *has* the change |
-| **Where** | `pg_wal/` on disk (written almost immediately) | `shared_buffers` in RAM |
-| **Form** | Sequential, append-only log | The actual table/index page |
-| **Purpose** | **Durability** + recovery + replication | **Performance** — avoid random disk writes |
-| **Write pattern** | Sequential (fast on any disk) | Random (scattered across data files) |
-| **When it hits disk** | At/around **COMMIT** (fsync) | **Later**, lazily, at a checkpoint or under memory pressure |
-
----
-
-## What is a dirty buffer?
-
-PostgreSQL never edits table files directly on disk. It loads an 8KB page into `shared_buffers` (RAM), modifies it there, and marks it **dirty** (changed in memory, not yet written back to the data file).
+- **Dirty buffer** — an 8KB data page modified in `shared_buffers` (RAM) but not yet written to the data file. Flushed lazily (batched) to avoid slow random writes.
+- **WAL record** — a compact, sequential log of the change, `fsync`'d to disk at **COMMIT**. This is what makes a commit durable.
+- **Write-ahead rule** — a dirty buffer is never written to the data file before its WAL record is on disk.
+- **Crash recovery (REDO)** — on restart, Postgres replays WAL since the last checkpoint to rebuild dirty buffers lost from RAM → no committed data lost.
+- **Checkpoint** — flushes all dirty buffers to data files and advances the *redo point* so older WAL can be recycled. Checkpoint spacing bounds crash-recovery time.
 
 ```
-UPDATE customers SET email='x' WHERE id=42;
-        |
-        v
-Load page into shared_buffers (if not already there)
-        |
-        v
-Modify the row in memory  ->  page is now DIRTY
-                              (RAM has new data, disk file still has old data)
+COMMIT ──> WAL fsync'd (durable) ─────────────────►
+               │                                    │
+         dirty buffer in RAM ──────────► CHECKPOINT flushes to data file,
+                                          advances redo point, recycles old WAL
 ```
 
-Writing each change straight to the data file would be a **random write** to a scattered location every time — slow. Batching dirty pages and flushing later (coalescing many changes to the same page into one write) is far more efficient.
-
----
-
-## What is WAL?
-
-Before the change is made to the buffer, PostgreSQL writes a **WAL record** — a compact description of the change — to the write-ahead log. At COMMIT, that record is **fsync'd to disk**.
-
-```
-UPDATE customers ...
-        |
-        v
-1. Write WAL record ("on page X, set row 42 email='x'")  -> WAL buffer
-2. Modify the data page in shared_buffers                 -> dirty buffer
-        |
-   COMMIT
-        v
-3. fsync WAL to disk   <-- THIS is what makes the commit durable
-```
-
-The WAL hits disk at commit; the dirty data page does **not**. The commit is safe the instant the WAL is flushed, even though the table page is still only in RAM.
-
----
-
-## The rule: Write-Ahead (WAL-before-data)
-
-> A dirty buffer may **never** be written to the data file before its corresponding WAL record is on disk.
-
-This is the guarantee that makes the scheme safe. WAL is the source of truth for durability; the data file catches up later.
-
----
-
-## What happens on a crash
-
-Crash after COMMIT but **before** the dirty buffer was flushed:
-
-```
-On disk:  WAL has the change  OK      Data file has OLD data  (stale)
-                |
-          Server restarts
-                |
-                v
-        Crash recovery / REDO:
-        replay WAL records -> re-apply changes to data files
-                |
-                v
-        Data file now has the committed change  OK
-```
-
-The dirty buffer was lost (RAM only), but the **WAL survived**, so recovery replays it and reconstructs the change. **No committed data is lost** — the entire point of WAL.
-
----
-
-## Checkpoints — reconciling the two
-
-A **checkpoint** flushes **all current dirty buffers** to the data files and records "everything up to WAL position X is safely persisted" (the redo point).
-
-```
-Checkpoint:
-  - flush all dirty buffers -> data files
-  - record the WAL redo point
-  - WAL before that point is no longer needed for crash recovery (can recycle)
-```
-
-After a checkpoint, crash recovery only needs to replay WAL **since the last checkpoint** — so checkpoint frequency bounds recovery time.
-
-```
-Timeline:
-  COMMIT ──> WAL on disk (durable) ──────────────►
-                 |                                 |
-           dirty buffer in RAM ───────────► CHECKPOINT flushes it to data file
-```
+**Why both:** commit = one fast sequential WAL write (durable) + data files updated lazily in batches (fast). Durability *and* speed.
 
 ### What triggers a checkpoint
-- **Time:** every `checkpoint_timeout` (default 5 min)
-- **Volume:** WAL since last checkpoint approaches `max_wal_size` (default 1GB)
-- **Manual:** `CHECKPOINT;` command
-- **Events:** shutdown, `pg_basebackup`, etc.
-
-### Key checkpoint parameters
-| Parameter | Default | Role |
-|-----------|---------|------|
-| `checkpoint_timeout` | 5min | Max time between checkpoints |
-| `max_wal_size` | 1GB | Soft cap on WAL before a checkpoint is forced |
-| `min_wal_size` | 80MB | Floor for recycled WAL files |
-| `checkpoint_completion_target` | 0.9 | Spread the flush over this fraction of the interval (smooths I/O) |
+| Trigger | Parameter | Counter in `pg_stat_bgwriter` |
+|---------|-----------|-------------------------------|
+| **Time** | `checkpoint_timeout` (default 5min) | `checkpoints_timed` |
+| **WAL volume** | `max_wal_size` (default 1GB) | `checkpoints_req` |
+| Manual / events | `CHECKPOINT;`, shutdown, basebackup | either |
 
 ---
 
-## `checkpoint_timeout` — the time-based trigger
-
-| | |
-|---|---|
-| **Default** | `5min` |
-| **Range** | 30s – 1d |
-| **Context** | `sighup` — change with reload, **no restart** |
-| **Role** | Maximum time between automatic checkpoints |
-
-A checkpoint fires on **whichever comes first**:
-
-| Trigger | Parameter | Counter |
-|---------|-----------|---------|
-| **Time** | `checkpoint_timeout` | `checkpoints_timed` |
-| **Volume** | `max_wal_size` | `checkpoints_req` |
-
-Trade-off:
-```
-short checkpoint_timeout -> frequent checkpoints -> faster crash recovery,
-                                                    more I/O + more full_page_writes (more WAL)
-long  checkpoint_timeout -> rare checkpoints     -> smoother I/O, less WAL,
-                                                    longer crash recovery
-```
-
-Production systems commonly **raise** it (15–30 min) with `checkpoint_completion_target = 0.9` to cut checkpoint I/O spikes and WAL amplification, accepting slightly longer recovery.
+## Find the current settings
 
 ```sql
-ALTER SYSTEM SET checkpoint_timeout = '15min';
-ALTER SYSTEM SET checkpoint_completion_target = 0.9;  -- spread writes over ~13.5 min
-SELECT pg_reload_conf();
-```
-
----
-
-## `max_wal_size` and how it relates to checkpoints
-
-`max_wal_size` is a **soft limit on how much WAL accumulates between checkpoints**. It is *not* a hard disk cap and *not* the size of a single WAL file — it's the budget of WAL allowed to pile up before Postgres says "that's enough, checkpoint now."
-
-### A checkpoint is triggered by whichever comes first:
-```
-TIME:    checkpoint_timeout elapses (default 5 min)          -> "timed" checkpoint
-VOLUME:  WAL written since last checkpoint nears max_wal_size -> "requested" checkpoint
-```
-
-- Hit the **timer** first → counts in `checkpoints_timed`.
-- Hit the **WAL volume** first → counts in `checkpoints_req` (a *demand/forced* checkpoint).
-
-### Why the relationship matters
-A checkpoint must flush all dirty buffers — that's an I/O burst. So you want checkpoints **spaced out and predictable**, ideally driven by the timer, not by WAL filling up:
-
-- **`checkpoints_req` high vs `checkpoints_timed`** → WAL is filling faster than `checkpoint_timeout`, forcing frequent demand checkpoints. Frequent checkpoints = more `full_page_writes` (the first change to a page after a checkpoint writes the whole page to WAL), which generates *even more* WAL → a vicious cycle. **Fix: raise `max_wal_size`.**
-- **`max_wal_size` too small** → constant forced checkpoints, I/O spikes, WAL amplification.
-- **`max_wal_size` too large** → fewer checkpoints (good for steady-state I/O) but **longer crash recovery** (more WAL to replay) and more disk used by `pg_wal`.
-
-So `max_wal_size` is the main knob to **trade checkpoint frequency against crash-recovery time and disk usage**:
-
-```
-small max_wal_size  ->  frequent checkpoints  ->  fast recovery, more I/O churn, WAL amplification
-large max_wal_size  ->  rare checkpoints      ->  slow recovery, smoother I/O, more pg_wal disk
-```
-
-### Practical tuning
-```sql
--- If checkpoints_req is climbing, give WAL more room
-ALTER SYSTEM SET max_wal_size = '4GB';
-ALTER SYSTEM SET checkpoint_timeout = '15min';
-ALTER SYSTEM SET checkpoint_completion_target = 0.9;  -- spread flush, avoid spikes
-SELECT pg_reload_conf();
-```
-Rule of thumb: size `max_wal_size` so that under normal write load, checkpoints are driven by `checkpoint_timeout` (timed), not by volume (requested).
-
----
-
-## Finding the current settings
-
-### See the values
-```sql
--- Quick look
-SHOW checkpoint_timeout;
-SHOW max_wal_size;
-SHOW min_wal_size;
-SHOW checkpoint_completion_target;
-
--- All checkpoint/WAL settings at once, with units and source
+-- All relevant settings with units, source, and how to change them
 SELECT name, setting, unit, source, context, pending_restart
 FROM pg_settings
 WHERE name IN (
@@ -219,75 +46,34 @@ WHERE name IN (
 ORDER BY name;
 ```
 
-Key columns in `pg_settings`:
-- **`setting` + `unit`** — current value and its unit (e.g. `15` `min`, `4096` `MB`).
-- **`source`** — where it came from: `default`, `configuration file`, `database`, `session`, `override`. Tells you if anything actually overrode the default.
-- **`context`** — how it can be changed: `postmaster` (restart), `sighup` (reload), `user` (per-session). `checkpoint_timeout` and `max_wal_size` are both `sighup` → reload, no restart.
-- **`pending_restart`** — `true` if you changed a restart-only setting that hasn't taken effect yet.
+Key columns:
+- **`source`** — `default` / `configuration file` / `database` / `session` / `override` (did anything actually change it?)
+- **`context`** — `postmaster` = restart, `sighup` = reload, `user` = per-session. `checkpoint_timeout` and `max_wal_size` are both **`sighup` → reload, no restart**.
+- **`pending_restart`** — `true` if a restart-only change hasn't taken effect.
 
-### Where a value came from (which file/line)
 ```sql
-SELECT name, setting, sourcefile, sourceline
-FROM pg_settings
-WHERE name IN ('checkpoint_timeout', 'max_wal_size');
+-- Which file/line set a value
+SELECT name, setting, sourcefile, sourceline FROM pg_settings WHERE name = 'max_wal_size';
 ```
 
-### Check checkpoint behavior right now
+---
+
+## The #1 health signal: timed vs requested checkpoints
+
 ```sql
--- Are checkpoints timed (good) or requested/forced (need tuning)?
 SELECT checkpoints_timed, checkpoints_req,
        round(100.0 * checkpoints_req /
              nullif(checkpoints_timed + checkpoints_req, 0), 1) AS pct_forced
 FROM pg_stat_bgwriter;
 ```
-`pct_forced` near 0 = healthy. Climbing = `max_wal_size` too small.
+
+> **Golden rule:** checkpoints should be **timed**, almost never **requested**. `pct_forced ≈ 0` = healthy. Rising `checkpoints_req` = WAL is filling faster than `checkpoint_timeout` → **raise `max_wal_size`**.
+
+Why forced checkpoints are bad: each checkpoint resets `full_page_writes`, so frequent checkpoints write more full pages to WAL → *more* WAL → even more forced checkpoints (a vicious cycle) plus I/O spikes.
 
 ---
 
-## How to make best-practice changes
-
-### The golden rule
-> Tune so that under normal load, checkpoints are triggered by **`checkpoint_timeout` (timed)**, almost never by **`max_wal_size` (requested)**. Verify with `checkpoints_req ≈ 0`.
-
-### Step 1 — Measure your WAL generation rate
-Size `max_wal_size` to your actual write volume, not a guess:
-```sql
--- Reading 1
-SELECT pg_current_wal_lsn();           -- e.g. 3/A2000000
--- ...wait ~5 min under normal load...
--- Reading 2, then diff:
-SELECT pg_size_pretty(pg_wal_lsn_diff('<reading2>', '<reading1>')) AS wal_in_interval;
-```
-
-### Step 2 — Size `max_wal_size`
-```
-max_wal_size  ≈  (WAL generated per checkpoint_timeout interval)  ×  2
-```
-The ×2 gives margin for bursts and the fact that the budget spans roughly two checkpoint cycles.
-Example: ~2 GB WAL per 15 min → `max_wal_size ≈ 4–6 GB`.
-
-### Step 3 — Apply (both are reloadable, no restart)
-```sql
-ALTER SYSTEM SET checkpoint_timeout = '15min';
-ALTER SYSTEM SET max_wal_size = '4GB';
-ALTER SYSTEM SET min_wal_size = '1GB';
-ALTER SYSTEM SET checkpoint_completion_target = 0.9;
-SELECT pg_reload_conf();
-```
-`ALTER SYSTEM` writes to `postgresql.auto.conf` (overrides `postgresql.conf`). To undo:
-```sql
-ALTER SYSTEM RESET max_wal_size;
-SELECT pg_reload_conf();
-```
-
-### Step 4 — Verify it worked
-```sql
-SHOW max_wal_size;                                   -- confirms new value
-SELECT name, setting, pending_restart FROM pg_settings WHERE name='max_wal_size';
--- Later, re-check the counter trend:
-SELECT checkpoints_timed, checkpoints_req FROM pg_stat_bgwriter;
-```
-If `checkpoints_req` keeps rising, raise `max_wal_size` further and re-measure.
+## Optimal settings
 
 ### Recommended starting values
 | Setting | Default | General production | Write-heavy OLTP |
@@ -297,114 +83,116 @@ If `checkpoints_req` keeps rising, raise `max_wal_size` further and re-measure.
 | `min_wal_size` | `80MB` | `1GB` | `2GB` |
 | `checkpoint_completion_target` | `0.9` | `0.9` | `0.9` |
 
-### Trade-off to remember
+### Size `max_wal_size` from real data (don't guess)
+```sql
+-- Reading 1
+SELECT pg_current_wal_lsn();
+-- ...wait ~5 min under normal load...
+-- Reading 2 then diff:
+SELECT pg_size_pretty(pg_wal_lsn_diff('<reading2>', '<reading1>')) AS wal_in_interval;
+```
+```
+max_wal_size  ≈  (WAL per checkpoint_timeout interval)  ×  2
+```
+×2 gives margin for bursts and the ~2-cycle budget. E.g. 2 GB per 15 min → `max_wal_size ≈ 4–6 GB`.
+
+### Apply (reloadable, no restart)
+```sql
+ALTER SYSTEM SET checkpoint_timeout = '15min';
+ALTER SYSTEM SET max_wal_size = '4GB';
+ALTER SYSTEM SET min_wal_size = '1GB';
+ALTER SYSTEM SET checkpoint_completion_target = 0.9;
+SELECT pg_reload_conf();
+
+-- undo a change:
+-- ALTER SYSTEM RESET max_wal_size;  SELECT pg_reload_conf();
+```
+(`ALTER SYSTEM` writes `postgresql.auto.conf`, overriding `postgresql.conf`.)
+
+### Verify
+```sql
+SHOW max_wal_size;
+SELECT checkpoints_timed, checkpoints_req FROM pg_stat_bgwriter;  -- req should stop climbing
+```
+
+### Core trade-off (bound by your RTO)
 ```
 bigger max_wal_size + longer checkpoint_timeout
    + fewer checkpoints, less I/O, less WAL amplification
    - longer crash recovery, more pg_wal disk
 
-smaller max_wal_size + shorter checkpoint_timeout
+smaller / shorter
    + faster crash recovery, less WAL disk
    - frequent checkpoints, I/O spikes, more full_page_writes
 ```
-Bound `checkpoint_timeout` by your **RTO** (recovery time budget), and provision **`pg_wal` disk well above `max_wal_size`** (it's a soft limit and can be exceeded under load or with inactive replication slots).
-
-### Checklist
-1. Raise `checkpoint_timeout` to ~15 min (or align to RTO).
-2. Measure WAL/interval, set `max_wal_size` ≈ 2× that.
-3. Leave `checkpoint_completion_target = 0.9`.
-4. Set `min_wal_size` to ~1–2 GB to reduce file churn.
-5. `SELECT pg_reload_conf();` then confirm with `SHOW`.
-6. Watch `checkpoints_req` stay near 0 in `pg_stat_bgwriter`; re-tune if not.
-7. Ensure `pg_wal` disk headroom over `max_wal_size`.
+Provision **`pg_wal` disk well above `max_wal_size`** — it's a soft limit and can be exceeded under load or with inactive replication slots.
 
 ---
 
-## Reading `pg_stat_bgwriter` (interpretation cheat-sheet)
+## Troubleshooting
 
-```sql
-SELECT * FROM pg_stat_bgwriter;
-```
-
-| Field | Meaning | What to watch for |
-|-------|---------|-------------------|
-| `checkpoints_timed` | Checkpoints fired by `checkpoint_timeout` | Want this to dominate |
-| `checkpoints_req` | Checkpoints forced by `max_wal_size` (demand) | **High vs timed → raise `max_wal_size`** |
-| `checkpoint_write_time` | Total ms writing during checkpoints | Large is fine — it's spread on purpose |
-| `checkpoint_sync_time` | Total ms in `fsync` at checkpoint end | Spikes → slow storage |
-| `buffers_checkpoint` | Dirty pages written by checkpointer | Planned writes (good) |
-| `buffers_clean` | Dirty pages written by the **background writer** | 0 = bgwriter idle/too conservative |
-| `maxwritten_clean` | Times bgwriter stopped early (hit its cap) | High → raise `bgwriter_lru_maxpages` |
-| `buffers_backend` | Dirty pages **backends flushed themselves** | High proportion → cache pressure; make bgwriter aggressive / raise `shared_buffers` |
-| `buffers_backend_fsync` | Times a backend did its own fsync | **Must be ~0**; >0 = fsync queue overflow (serious) |
+### `pg_stat_bgwriter` field reference
+| Field | Meaning | Watch for |
+|-------|---------|-----------|
+| `checkpoints_timed` | Timed checkpoints | Want this to dominate |
+| `checkpoints_req` | Forced by `max_wal_size` | **High vs timed → raise `max_wal_size`** |
+| `checkpoint_write_time` | ms writing during checkpoints | Large is fine (spread on purpose) |
+| `checkpoint_sync_time` | ms in `fsync` at checkpoint end | Spikes → slow storage |
+| `buffers_checkpoint` | Pages written by checkpointer | Planned writes (good) |
+| `buffers_clean` | Pages written by background writer | 0 = bgwriter idle/too conservative |
+| `maxwritten_clean` | Times bgwriter hit its write cap | High → raise `bgwriter_lru_maxpages` |
+| `buffers_backend` | Pages backends flushed themselves | High share → cache pressure |
+| `buffers_backend_fsync` | Backends doing own fsync | **Must be ~0**; >0 = fsync queue overflow (serious) |
 | `buffers_alloc` | Buffers allocated | Cache demand gauge |
 
-### Healthy picture (the ideal)
-- `checkpoints_req = 0` (or ≪ `checkpoints_timed`) → WAL not outpacing the timer; `max_wal_size` sized fine.
-- `buffers_backend_fsync = 0` → no fsync-queue pressure.
-- Most writes come from `buffers_checkpoint` (planned), not `buffers_backend`.
+### Symptom → cause → fix
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| `checkpoints_req` rising / high `pct_forced` | `max_wal_size` too small for write rate | Raise `max_wal_size`; raise `checkpoint_timeout` |
+| Periodic **latency/IO spikes** every few min | Checkpoint flush bursts | `checkpoint_completion_target=0.9`; raise `checkpoint_timeout`; raise `max_wal_size` |
+| **WAL fills the disk** (`pg_wal` grows unbounded) | Inactive replication slot, failing `archive_command`, or orphaned slot | Drop/fix slot (`pg_drop_replication_slot`); fix archiving; check `pg_replication_slots` |
+| **Slow commits** | `fsync` latency on WAL storage | Put `pg_wal` on fast/low-latency disk; check `checkpoint_sync_time` |
+| **Long crash recovery / startup** | Checkpoints too far apart (too much WAL to replay) | Lower `checkpoint_timeout` / `max_wal_size` (trades steady-state I/O for faster recovery) |
+| `buffers_backend` large share + `buffers_clean=0` | bgwriter too passive, cache pressure | `bgwriter_lru_maxpages`↑, `bgwriter_delay`↓; raise `shared_buffers` |
+| `buffers_backend_fsync > 0` | fsync request queue overflow | Investigate I/O subsystem; raise `shared_buffers` |
+| `maxwritten_clean` high | bgwriter stopping early | Raise `bgwriter_lru_maxpages` |
 
-### Pressure signals & fixes
-| Signal | Likely fix |
-|--------|------------|
-| `checkpoints_req` rising | Raise `max_wal_size`, raise `checkpoint_timeout` |
-| `buffers_backend` large share + `buffers_clean=0` | Make bgwriter aggressive (`bgwriter_lru_maxpages`↑, `bgwriter_delay`↓); raise `shared_buffers` |
-| `buffers_backend_fsync > 0` | Investigate I/O subsystem; increase `shared_buffers`; check storage |
-| `maxwritten_clean` high | Raise `bgwriter_lru_maxpages` |
+> A high `buffers_backend` share is **normal during one-off bulk loads** (a burst fills `shared_buffers` faster than the gentle bgwriter reacts). Only a concern if it persists under steady OLTP load.
 
-> Note: a high `buffers_backend` share is **normal during one-off bulk loads** (a big insert burst fills `shared_buffers` faster than the gentle bgwriter reacts). It's only a concern if it persists under steady OLTP load.
-
-**Version note:** on **PG16** these all live in `pg_stat_bgwriter`. In **PG17+**, `buffers_backend` / `buffers_backend_fsync` moved to `pg_stat_io`, and checkpoint counters moved to `pg_stat_checkpointer`.
-
----
-
-## Analogy
-
-A busy kitchen:
-
-- **WAL** = the **order ticket** written immediately and pinned up. Compact, sequential, never lost. If the kitchen burns down, the tickets tell you exactly what to remake.
-- **Dirty buffer** = the **half-plated dish** on the counter. The real food, but rebuildable from the ticket if lost.
-- **Checkpoint** = periodically **delivering all finished plates** to tables and clearing tickets you no longer need.
-
----
-
-## Why both exist
-
-| If you only had... | Problem |
-|--------------------|---------|
-| Only dirty buffers (no WAL) | A crash loses everything in RAM → committed data lost → no durability |
-| Only WAL, flush data every commit | Every commit = slow random writes to data files → terrible performance |
-
-Together: **commit = one fast sequential WAL write (durable)** + **data files updated lazily in batches (fast)**. Durability *and* speed.
-
----
-
-## Operational issues (DBRE relevance)
-
-| Symptom | Cause / fix |
-|---------|-------------|
-| **WAL fills the disk** | Inactive replication slot or failing `archive_command` prevents WAL recycling → see deep dive §1.2 |
-| **Checkpoint I/O spikes / latency** | Too many dirty buffers flushed at once → raise `max_wal_size`, set `checkpoint_completion_target=0.9` |
-| **Slow commits** | `fsync` storage latency on WAL → put `pg_wal` on fast disk |
-| **Long crash recovery** | Checkpoints too far apart → lower `checkpoint_timeout` / `max_wal_size` (trades steady-state I/O for faster recovery) |
-| **`shared_buffers` too small** | Pages evicted while still dirty → extra I/O churn |
-
-Monitor:
+### Diagnostic queries
 ```sql
--- Checkpoint & dirty-buffer activity (PG16: pg_stat_checkpointer; older: pg_stat_bgwriter)
-SELECT * FROM pg_stat_bgwriter;
--- buffers_checkpoint  = pages written by checkpoints
--- buffers_clean       = pages written by background writer
--- buffers_backend     = pages a backend had to write itself (pressure signal)
+-- WAL position & last checkpoint location
+SELECT pg_current_wal_lsn();
+SELECT redo_lsn, checkpoint_lsn FROM pg_control_checkpoint();
 
-SELECT pg_current_wal_lsn();           -- current WAL write position
-SELECT checkpoint_lsn FROM pg_control_checkpoint();  -- last checkpoint location
+-- WAL generated since a known LSN
+SELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')) AS wal_total;
+
+-- Replication slots retaining WAL (a classic "disk full" cause)
+SELECT slot_name, active, wal_status,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal
+FROM pg_replication_slots;
+
+-- Total pg_wal size on disk
+SELECT pg_size_pretty(sum(size)) FROM pg_ls_waldir();
 ```
 
-Tip: frequent `buffers_backend` writes mean backends are flushing dirty pages themselves because the bgwriter/checkpointer can't keep up — a sign to tune checkpoint/bgwriter settings.
+**Version note:** on **PG16** these counters live in `pg_stat_bgwriter`. In **PG17+**, `buffers_backend`/`buffers_backend_fsync` moved to `pg_stat_io`, and checkpoint counters to `pg_stat_checkpointer`.
+
+---
+
+## Checklist
+
+1. Raise `checkpoint_timeout` to ~15 min (or align to your RTO).
+2. Measure WAL/interval (`pg_wal_lsn_diff`), set `max_wal_size` ≈ 2× that.
+3. Leave `checkpoint_completion_target = 0.9`.
+4. Set `min_wal_size` ~1–2 GB to reduce file churn.
+5. `SELECT pg_reload_conf();` then confirm with `SHOW`.
+6. Watch `checkpoints_req` / `pct_forced` stay near 0; re-tune if not.
+7. Keep `pg_wal` disk headroom over `max_wal_size`; monitor inactive replication slots.
 
 ---
 
 ## One-liner for the interview
 
-> *"A dirty buffer is the actual 8KB data page modified in RAM but not yet written to the data file; the WAL record is a compact, sequential log of that change flushed to disk at commit. WAL is written before the data page (write-ahead rule) and gives durability — on crash it's replayed to recover changes whose dirty buffers were lost. Checkpoints flush all dirty buffers to data files and advance the redo point, turning slow random writes into fast sequential WAL plus batched flushing. Checkpoint frequency trades steady-state I/O against crash-recovery time."*
+> *"I size `max_wal_size` to ~2× the WAL generated per `checkpoint_timeout` interval (measured with `pg_wal_lsn_diff`) and set `checkpoint_timeout` to ~15 min with `checkpoint_completion_target=0.9`. The goal is timer-driven checkpoints — I verify `checkpoints_req` stays near zero in `pg_stat_bgwriter`. It's a trade-off between checkpoint I/O and crash-recovery time, bounded by RTO and `pg_wal` disk headroom. For 'WAL filling the disk' I check inactive replication slots and archiving first."*
