@@ -256,6 +256,37 @@ Because `use_pg_rewind: true` and `wal_log_hints: on`, Patroni runs **`pg_rewind
 
 ## 8. HAProxy — route clients automatically
 
+### What HAProxy is for (and what it is *not*)
+
+HAProxy is a **load balancer / proxy** — the single, stable entry point for the cluster. It is **not** a dashboard (it has a small stats page, but that's a side feature; its real job is routing traffic).
+
+**The problem it solves:** in a Patroni cluster the primary moves around — node1 is primary today, but after a failover it might be node2. Without a proxy, every app would have a connection string pointing at the old primary and would need reconfiguring/restarting on each failover, defeating the point of automatic HA.
+
+```
+                        ┌──────────────┐
+   app connects to      │   HAProxy    │
+   ONE stable address   │  :5000 write │──► whichever node is PRIMARY right now
+                        │  :5001 read  │──► whichever nodes are REPLICAS
+                        └──────────────┘
+```
+
+**How it knows where to send traffic:** HAProxy continuously calls each node's **Patroni REST API** (ports 8008–8010), which it trusts as the source of truth:
+- `/primary` returns HTTP 200 **only** on the current leader → the `primary` backend keeps only the leader UP.
+- `/replica` returns HTTP 200 **only** on replicas → the `replicas` backend keeps only replicas UP.
+
+So when a failover happens, the `/primary` check moves to the new leader and HAProxy **automatically** sends writes there — no app changes, no restarts. (This is also why you'll see `... is DOWN ... code: 503` warnings on startup: HAProxy is correctly excluding each node from the pool where it doesn't belong — replicas are "DOWN" in the `primary` backend, the leader is "DOWN" in the `replicas` backend. That's healthy, not an error.)
+
+**Two stable endpoints you get:**
+
+| Endpoint | Routes to | Use for |
+|----------|-----------|---------|
+| `127.0.0.1:5000` | current primary | writes (INSERT/UPDATE/DELETE) |
+| `127.0.0.1:5001` | replicas (round-robin) | reads (SELECT), to spread load |
+
+**The stats page** (`http://127.0.0.1:7000/`) is just a monitoring convenience showing UP/DOWN per pool — routing works whether or not you open it.
+
+**Alternatives to HAProxy** (interview-worthy): PgBouncer (adds pooling), a floating Virtual IP (VIP) + keepalived, or `libpq` multi-host strings with `target_session_attrs=read-write` (client picks the writable host, no proxy). HAProxy itself is a single point of failure, so production runs **two HAProxy instances** behind a VIP.
+
 ### `~/patroni-lab/haproxy.cfg`
 ```
 global
