@@ -21,8 +21,8 @@ ORDER BY duration DESC;
 \echo '=== Freeze / wraparound pressure per table (oldest XID first) ==='
 SELECT c.relname,
        age(c.relfrozenxid) AS xid_age,
-       round(100.0 * age(c.relfrozenxid) /
-             current_setting('autovacuum_freeze_max_age')::float, 1) AS pct_to_forced_av
+       round((100.0 * age(c.relfrozenxid) /
+             current_setting('autovacuum_freeze_max_age')::numeric), 1) AS pct_to_forced_av
 FROM pg_class c
 WHERE c.relkind = 'r'
 ORDER BY age(c.relfrozenxid) DESC
