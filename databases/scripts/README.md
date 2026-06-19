@@ -31,6 +31,7 @@ Run the whole suite at once (from the DBA repo root):
 | `indexes.sql` | Seq-scan pressure (missing indexes), unused indexes, index sizes |
 | `slow_queries.sql` | Top queries by total/mean time (**needs `pg_stat_statements`**) |
 | `settings.sql` | Key config values grouped (memory, WAL, autovacuum, planner, replication) + non-default settings |
+| `settings_check.sql` | Whether/how a setting was changed: vs default, source/file, applied (`pg_file_settings`), pending restart |
 | `all.sql` | Sources all of the above (except `slow_queries.sql`) in one go |
 
 ## Notes
