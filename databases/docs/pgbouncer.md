@@ -85,6 +85,8 @@ cat /opt/homebrew/etc/pgbouncer/userlist.txt
 
 Create `/opt/homebrew/etc/pgbouncer/pgbouncer.ini`:
 
+> **Important:** PgBouncer's `.ini` parser does **not** support inline comments after a value — `max_client_conn = 1000  ; note` is read as the literal value `1000  ; note` and fails to load. Put every comment on its **own line**.
+
 ```ini
 [databases]
 ; expose pg_lab through the pooler (clients connect to "pg_lab" on 6432)
@@ -94,23 +96,25 @@ pg_lab = host=127.0.0.1 port=5432 dbname=pg_lab
 listen_addr = 127.0.0.1
 listen_port = 6432
 
-; --- authentication ---
+; authentication
 auth_type = scram-sha-256
 auth_file = /opt/homebrew/etc/pgbouncer/userlist.txt
 
-; --- pooling ---
+; pooling
+; max_client_conn  = how many app clients can connect to PgBouncer
+; default_pool_size = real server connections per (user, db) pair
 pool_mode = transaction
-max_client_conn = 1000      ; how many app clients can connect to PgBouncer
-default_pool_size = 20      ; real server connections per (user,db) pair
+max_client_conn = 1000
+default_pool_size = 20
 min_pool_size = 5
 reserve_pool_size = 5
 reserve_pool_timeout = 3
 
-; --- admin / monitoring console ---
+; admin / monitoring console
 admin_users = app
 stats_users = app
 
-; --- logging ---
+; logging
 logfile = /opt/homebrew/var/log/pgbouncer.log
 pidfile = /opt/homebrew/var/run/pgbouncer.pid
 ```
@@ -195,6 +199,7 @@ If your app needs full session semantics, use **session** pool mode (less reuse,
 | Clients hang / `cl_waiting` high | pool exhausted — raise `default_pool_size`, or fix slow/long transactions holding server conns |
 | `pgbouncer cannot connect to server` | Postgres down, wrong host/port in `[databases]`, or `pg_hba.conf` rejects the pooler |
 | Prepared-statement errors | transaction mode caveat — set `max_prepared_statements` or disable server-side prepares |
+| `invalid value "... ; ..."` / `cannot load config file` | Inline comment after a value — PgBouncer reads the whole line as the value. Move comments to their own line |
 | Config change not taking | `RELOAD;` in the admin console, or restart the service |
 
 ---
