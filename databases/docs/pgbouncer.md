@@ -59,21 +59,27 @@ host    all    all    127.0.0.1/32    scram-sha-256
 
 ## 3. Build the auth file (`userlist.txt`)
 
-PgBouncer needs to verify the client's password. With SCRAM (PG16 default), copy the role's stored SCRAM verifier from the server into `userlist.txt`:
+PgBouncer needs to verify the client's password. With SCRAM (PG16 default), copy the role's stored SCRAM verifier from the server into `userlist.txt`.
+
+First create the config directory (it does not exist after a fresh install):
 
 ```bash
-# Generate the userlist line from the server's stored verifier
-psql -d pg_lab -tAc \
-  "SELECT '\"' || rolname || '\" \"' || rolpassword || '\"' \
-   FROM pg_authid WHERE rolname = 'app';" \
-  > /opt/homebrew/etc/pgbouncer/userlist.txt
+mkdir -p /opt/homebrew/etc/pgbouncer
+```
+
+Then generate the auth line. Keep it on **one line** and use `-tAc` so psql runs it as a query (a multi-line command with `\` and the SQL passed as the first argument is treated as a *connection string* and fails):
+
+```bash
+psql -d pg_lab -tAc "SELECT '\"' || rolname || '\" \"' || rolpassword || '\"' FROM pg_authid WHERE rolname = 'app';" > /opt/homebrew/etc/pgbouncer/userlist.txt
 
 cat /opt/homebrew/etc/pgbouncer/userlist.txt
 # "app" "SCRAM-SHA-256$4096:...."
 ```
 
-> Create the dir first if needed: `mkdir -p /opt/homebrew/etc/pgbouncer`.
-> `pg_authid` requires superuser. The `rolpassword` is the SCRAM verifier (not the plaintext) — safe to store.
+> - `-t` tuples-only, `-A` unaligned, `-c` run-and-exit — together they emit just the raw line.
+> - `pg_authid` requires **superuser**; on Homebrew that's usually your Mac user, so add `-U <youruser>` if you get a permission error.
+> - The `rolpassword` is the SCRAM verifier (not the plaintext) — safe to store.
+> - Empty file / `0 rows`? The `app` role does not exist yet — do step 2 first, then re-run this.
 
 ## 4. Configure `pgbouncer.ini`
 
