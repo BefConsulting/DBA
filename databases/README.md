@@ -20,6 +20,7 @@ databases/
 | [docs/deep-dive.md](docs/deep-dive.md) | The big one: internals (MVCC / WAL / vacuum / bloat / planner), performance tuning, HA & scaling, security |
 | [docs/performance-analysis.md](docs/performance-analysis.md) | Where to start, what to check — the full investigation funnel |
 | [docs/best-practices.md](docs/best-practices.md) | Production config checklist — Linux host + PostgreSQL server tuning |
+| [docs/pgbouncer.md](docs/pgbouncer.md) | Hands-on: set up PgBouncer connection pooling locally on macOS |
 | [docs/wal-and-checkpoints.md](docs/wal-and-checkpoints.md) | WAL vs dirty buffers, checkpoint tuning, crash recovery |
 | [docs/cache.md](docs/cache.md) | Cold vs warm cache, and how it shows up in `EXPLAIN` buffers |
 | [docs/ha-and-dr.md](docs/ha-and-dr.md) | Replication, failover automation (Patroni/DCS), disaster recovery & PITR |
@@ -59,3 +60,4 @@ See [scripts/README.md](scripts/README.md) for the full list.
 4. [docs/wal-and-checkpoints.md](docs/wal-and-checkpoints.md) + [docs/cache.md](docs/cache.md) — write path & memory
 5. [docs/best-practices.md](docs/best-practices.md) — production config checklist (host + server)
 6. [docs/ha-and-dr.md](docs/ha-and-dr.md) → [docs/patroni.md](docs/patroni.md) — availability & recovery
+7. [docs/pgbouncer.md](docs/pgbouncer.md) — connection pooling in front of the database
