@@ -47,4 +47,5 @@ Start with [databases/README.md](databases/README.md).
 
 ## Interview prep
 
-[prep.md](prep.md) — a role-focused study guide mapping required skills (PostgreSQL internals, HA/failover, performance, PITR, observability, distributed systems, Linux, IaC, security) to talking points, likely questions, and links into this handbook.
+- [prep.md](prep.md) — a role-focused study guide mapping required skills (PostgreSQL internals, HA/failover, performance, PITR, observability, distributed systems, Linux, IaC, security) to talking points, likely questions, and links into this handbook.
+- [interview-saas-hipaa-dbre.md](interview-saas-hipaa-dbre.md) — a 30-minute prep for a PostgreSQL DBRE/SRE role on a 24×7 HIPAA SaaS platform (SLOs/error budgets, Datadog, HIPAA, Azure/K8s, RepMgr/HAProxy/PgBouncer/PgBackRest, ITSM, ETL) with a time-boxed game plan and questions to ask back.
