@@ -1,8 +1,10 @@
 # PostgreSQL Best-Practice Configuration
 
-A checklist of what to tune at the **Linux host** level and in the **PostgreSQL** server for a production-grade deployment. Defaults ship conservative — these are the knobs that matter most. Each entry says **what it does** and **where you set it**.
+A checklist of what to tune in the **PostgreSQL server** for a production-grade deployment. Defaults ship conservative — these are the knobs that matter most. Each entry says **what it does** and **where you set it**.
 
-**See also:** [wal-and-checkpoints.md](wal-and-checkpoints.md) (checkpoint sizing) · [deep-dive.md](deep-dive.md) §2 (memory/planner), §4 (security) · [performance-analysis.md](performance-analysis.md) · [../scripts/settings.sql](../scripts/settings.sql) (audit current values)
+**For Linux host-level tuning** (sysctl, memory/overcommit, swappiness, dirty-page writeback, THP/huge pages, storage, CPU, limits) see the dedicated guide: **[linux.md](linux.md)**.
+
+**See also:** [linux.md](linux.md) (host/kernel tuning) · [wal-and-checkpoints.md](wal-and-checkpoints.md) (checkpoint sizing) · [deep-dive.md](deep-dive.md) §2 (memory/planner), §4 (security) · [performance-analysis.md](performance-analysis.md) · [../scripts/settings.sql](../scripts/settings.sql) (audit current values)
 
 > **Golden rule:** change one thing, measure, repeat. Use `databases/scripts/settings.sql` to see current values, their `source`, and whether they need a restart.
 
@@ -10,87 +12,7 @@ A checklist of what to tune at the **Linux host** level and in the **PostgreSQL*
 
 ## Part 1 — Linux host level
 
-**Where these live:** almost all are **kernel parameters (sysctl)**. View one with `sysctl vm.swappiness`, set it live with `sysctl -w vm.swappiness=1`, and make it **persistent** by adding it to `/etc/sysctl.conf` or a file in `/etc/sysctl.d/*.conf`, then applying with `sudo sysctl --system`. The THP and I/O-scheduler knobs live under `/sys/...` and are best persisted via a `tuned` profile, `systemd`, or a udev rule.
-
-### Memory & overcommit
-
-**What "memory overcommit" means:** Linux hands out **more memory than physically exists**, betting that processes won't actually use everything they ask for. When a program allocates (e.g. `malloc`), it gets *virtual* address space — a promise — and the kernel only maps real RAM when the program **touches** (writes to) a page. Because programs routinely reserve far more than they use (sparse allocations, `fork()` with copy-on-write, large arenas left mostly untouched), the kernel can safely "oversell" memory — much like an airline overbooking seats expecting no-shows.
-
-**The risk — the OOM killer:** the bet fails when processes really do touch more memory than physically exists. The kernel can't conjure RAM, so it invokes the **OOM (Out-Of-Memory) killer**, which picks a process and kills it to reclaim memory. For PostgreSQL this is dangerous: the OOM killer tends to target a high-memory process and may kill the **postmaster** (the parent process) — which drops every connection and takes the **entire instance** down, looking like a crash.
-
-**Why mode `2` for Postgres:** setting `vm.overcommit_memory=2` ("never overcommit") caps total allocations at `swap + (overcommit_ratio% × RAM)`. Past that line, a new allocation **fails cleanly** — the offending backend gets an "out of memory" error and that one query aborts, but **the postmaster and the rest of the instance survive**. You trade one failed query for protecting the whole database — converting a catastrophic, random kill into a contained, predictable error. This is exactly what you want on a 24×7 critical database.
-
-> **Caveat:** mode `2` only helps if your *normal* working set fits under the cap. Size `shared_buffers`, `work_mem × peak connections`, and `maintenance_work_mem` deliberately, or you'll hit allocation failures during ordinary operation. The cap protects you from runaways; it doesn't excuse undersizing RAM.
-
-The `_ratio` defaults to `50`; raise it toward `80`–`90` only when you've sized memory carefully and run minimal swap (committable memory = `swap + ratio% of RAM`).
-
-| Setting | Recommended | What it does & where |
-|---------|-------------|----------------------|
-| `vm.overcommit_memory` | `2` | **sysctl.** Controls how the kernel hands out memory. `0` (default) = **heuristic**: the kernel guesses if an allocation is reasonable and can still summon the **OOM killer** — which may kill the postmaster and take the whole instance down. `1` = **always overcommit** (never refuses; dangerous generally). `2` = **never overcommit**: allocations beyond the committable limit fail cleanly, so a runaway query errors instead of the server being killed. |
-| `vm.overcommit_ratio` | `80`–`90` (little/no swap) | **sysctl.** Only used when `overcommit_memory=2`. Committable memory = `swap + ratio% of RAM`. Set high when you've sized memory deliberately and run minimal swap. |
-| `vm.swappiness` | `1` (range `0`–`10`) | **sysctl.** How eagerly the kernel swaps RAM to disk. Low keeps PostgreSQL's shared buffers and page cache in RAM; high would swap out hot cache and tank latency. |
-| Transparent Huge Pages (THP) | **disabled** (`never`) | **`/sys/kernel/mm/transparent_hugepage/{enabled,defrag}`.** THP's background defrag causes unpredictable latency stalls in databases. Disable it (PostgreSQL recommends against THP). |
-| Explicit Huge Pages | size to cover `shared_buffers` | **`vm.nr_hugepages` sysctl.** Pre-allocates large (2MB) memory pages so the CPU's page tables are smaller and faster to walk. Pair with `huge_pages=try`/`on` in PostgreSQL. |
-
-```bash
-# Disable THP at runtime (persist via tuned/grub/systemd)
-echo never > /sys/kernel/mm/transparent_hugepage/enabled
-echo never > /sys/kernel/mm/transparent_hugepage/defrag
-```
-
-### Dirty page writeback (smooths I/O, avoids checkpoint stalls)
-
-**The concept:** when Postgres (or anything) writes, the data first lands in the kernel's **page cache** as a "dirty" page — modified in RAM but not yet on disk. The kernel decides *when* to flush those dirty pages down to storage. These four sysctls set the thresholds. There are **two pairs that control the same two thresholds** — one expressed in **bytes**, one as a **percentage of available memory**. You pick *one* unit per threshold; setting the `_bytes` form to non-zero disables its `_ratio` counterpart, and vice-versa (whichever you set last wins, and reading the other back shows `0`).
-
-The two thresholds, low to high:
-
-1. **Background threshold** — when dirty data crosses this, the kernel's flusher threads **start writing in the background**. Applications keep running normally. → `vm.dirty_background_bytes` *or* `vm.dirty_background_ratio`.
-2. **Hard (foreground) threshold** — when dirty data crosses this, the kernel **forces the writing process itself to block** and flush synchronously until it's back under the line. This is a latency cliff you want to avoid hitting. → `vm.dirty_bytes` *or* `vm.dirty_ratio`.
-
-| Setting | Recommended | What it does & where |
-|---------|-------------|----------------------|
-| `vm.dirty_background_ratio` | `5` (default `10`) | **sysctl.** Background threshold as a **percentage of available memory**. At this much dirty data, flusher threads start writing in the background (non-blocking). Default `10%` of RAM can be a lot of unflushed data on a big-memory host. |
-| `vm.dirty_ratio` | `10` (default `20`) | **sysctl.** Hard threshold as a **percentage of available memory**. Once dirty data hits this, writers are **forced to block** and flush synchronously — a stall. Must be **higher** than `dirty_background_ratio`. |
-| `vm.dirty_background_bytes` | e.g. `67108864` (64MB) | **sysctl.** Same background threshold, but as an **absolute byte count** instead of a percentage. Lower = flush early and often, so writeback is gentle. Setting this zeroes `dirty_background_ratio`. |
-| `vm.dirty_bytes` | e.g. `536870912` (512MB) | **sysctl.** Same hard ceiling, as an **absolute byte count**. Once hit, processes block and write synchronously. Keep it above the background threshold but bounded. Setting this zeroes `dirty_ratio`. |
-
-**Ratio vs bytes — which to use:**
-- The **`_ratio`** variants are a percentage of memory, so the *actual* dirty-data limit scales (often surprisingly large) with RAM. On a 256GB host the default `dirty_ratio = 20` permits ~51GB of dirty pages to accumulate before a forced flush — which then dumps to disk all at once, colliding with Postgres checkpoints to produce an **I/O write storm** and latency spikes.
-- The **`_bytes`** variants pin the threshold to a fixed, predictable amount regardless of RAM, so on **large-RAM hosts prefer `_bytes`** to keep writeback small and frequent. On smaller/standardized hosts the `_ratio` form is simpler and fine.
-- Whichever pair you choose, keep the **background threshold well below the hard threshold** (e.g. ~1:2) so the kernel starts flushing gently long before any process is forced to block. The goal is steady trickle-flush, never a sudden synchronous dump.
-
-```bash
-# View current values
-sysctl vm.dirty_background_ratio vm.dirty_ratio vm.dirty_background_bytes vm.dirty_bytes
-
-# Example: large-RAM host — switch to byte-based thresholds (persist in /etc/sysctl.d/)
-sysctl -w vm.dirty_background_bytes=67108864    # 64MB  → starts background flush
-sysctl -w vm.dirty_bytes=536870912              # 512MB → forced synchronous flush
-# (these two automatically set vm.dirty_background_ratio and vm.dirty_ratio to 0)
-```
-
-### Storage & filesystem
-- **Filesystem:** `ext4` or `xfs` (both well-tested for PG). Avoid network filesystems (NFS) for `PGDATA`.
-- **Mount option `noatime`** (in `/etc/fstab`): stops the FS from writing an access timestamp on every read.
-- **Separate block devices/volumes** for data (`PGDATA`), WAL (`pg_wal`), and optionally temp — isolates sequential WAL writes from random data I/O.
-- **I/O scheduler** (`/sys/block/<dev>/queue/scheduler`): `none`/`noop` for NVMe, `mq-deadline` for SSD; avoid `cfq`.
-- Ensure **reliable `fsync`** — disable volatile disk write caches that aren't battery/capacitor-backed, or a power loss can corrupt the database.
-- **RAID10** for write-heavy workloads; use a controller with a battery-backed write cache.
-
-### CPU, NUMA, scheduling
-- **CPU governor = `performance`** (set via `cpupower` or `/sys/devices/system/cpu/.../scaling_governor`): avoids the latency of frequency ramp-up.
-- On NUMA servers, cross-node memory access is slower; test `numactl --interleave=all` for the postmaster to spread memory evenly.
-
-### Limits, network, misc
-| Area | Recommended | What it does & where |
-|------|-------------|----------------------|
-| File descriptors | `LimitNOFILE=65535`+ | **systemd unit / `/etc/security/limits.conf`.** PG opens many files (relations, sockets); too low a limit causes "too many open files" errors. |
-| `net.core.somaxconn` | `1024`+ | **sysctl.** Max queued incoming connections; raise so connection bursts aren't dropped. |
-| TCP keepalives | tune `net.ipv4.tcp_keepalive_time` | **sysctl.** Detects dead client/replica peers so their connections get cleaned up. |
-| Time sync | run `chrony`/NTP | **service.** Accurate clocks are essential for replication ordering and correlating logs across hosts. |
-| Security | `PGDATA` mode `0700`, owned by `postgres` | **filesystem perms.** Plus firewall the port and run SELinux/AppArmor in enforcing mode. |
-
-> Note: modern PostgreSQL (9.3+) uses `mmap` for shared memory, so the legacy `kernel.shmmax`/`kernel.shmall` sysctl tuning is no longer needed — unless you force `huge_pages`.
+Moved to its own guide → **[linux.md](linux.md)**. It defines each kernel/host setting one at a time (memory & overcommit, `overcommit_ratio`, `swappiness`, dirty-page writeback, THP & huge pages, storage/filesystem, CPU/NUMA, limits & network) with **recommended values** and **how to set them** (live + persistent).
 
 ---
 
