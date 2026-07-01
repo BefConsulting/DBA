@@ -47,5 +47,5 @@ Start with [databases/README.md](databases/README.md).
 
 ## Interview prep
 
-- [prep.md](prep.md) — a role-focused study guide mapping required skills (PostgreSQL internals, HA/failover, performance, PITR, observability, distributed systems, Linux, IaC, security) to talking points, likely questions, and links into this handbook.
-- [interview-saas-hipaa-dbre.md](interview-saas-hipaa-dbre.md) — a 30-minute prep for a PostgreSQL DBRE/SRE role on a 24×7 HIPAA SaaS platform (SLOs/error budgets, Datadog, HIPAA, Azure/K8s, RepMgr/HAProxy/PgBouncer/PgBackRest, ITSM, ETL) with a time-boxed game plan and questions to ask back.
+- [dbre.md](dbre.md) — technical study guide for the PostgreSQL DBRE/SRE role (SLOs/error budgets, Datadog, HIPAA, Azure/K8s, RepMgr/HAProxy/PgBouncer/PgBackRest, ITSM, ETL) with a time-boxed game plan and questions to ask back.
+- [star-stories.md](star-stories.md) — manager/behavioral round: the STAR method, five elaborated stories, questions to ask, and logistics.
